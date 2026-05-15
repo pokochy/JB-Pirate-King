@@ -109,7 +109,7 @@ if _args_pre.model and _args_pre.model in _KNOWN_MODELS:
     else:
         SCALER_FILE = os.path.join(OUTPUT_DIR, f"scaler_{_args_pre.model}.json")
 
-IS_SUPERVISED = MODEL_FILE.startswith("model_sup_")
+IS_SUPERVISED = _args_pre.model in _SUP_MODELS
 
 
 # ── 스케일러 ──────────────────────────────────────────────────────
