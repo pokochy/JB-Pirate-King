@@ -67,7 +67,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset, random_split
+from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
 # ── 공통 설정 ─────────────────────────────────────────────────────
@@ -146,10 +146,10 @@ def scale_seq(seq, mins, maxs) -> list:
 # ══════════════════════════════════════════════════════════════════
 
 def load_normal_from_csv(path: str, max_seqs: int = 15000,
-                         max_mmsi: int = None) -> list:
-    """CSV에서 raw(스케일링 전) 정상 시퀀스 로드"""
+                         max_mmsi: int = None) -> dict:
+    """CSV에서 raw(스케일링 전) 정상 시퀀스를 MMSI별로 로드 → {mmsi: [seq, ...]}"""
     if not os.path.exists(path):
-        return []
+        return {}
     print(f"  [정상] CSV 로드: {path}")
     mmsi_data = defaultdict(list)
     with open(path, encoding="utf-8") as f:
@@ -169,7 +169,7 @@ def load_normal_from_csv(path: str, max_seqs: int = 15000,
         mmsis = mmsis[:max_mmsi]
 
     dt_idx = FEATURES.index("dt")
-    all_seqs = []
+    mmsi_seqs: dict = {}
     for mmsi in mmsis:
         records = mmsi_data[mmsi]
         seg, current = [], [records[0]]
@@ -180,103 +180,124 @@ def load_normal_from_csv(path: str, max_seqs: int = 15000,
             else:
                 current.append(rec)
         seg.append(current)
+        seqs = []
         for s in seg:
             if len(s) < SEQ_LEN:
                 continue
             for i in range(len(s) - SEQ_LEN + 1):
-                all_seqs.append(s[i:i + SEQ_LEN])
+                seqs.append(s[i:i + SEQ_LEN])
+        if seqs:
+            mmsi_seqs[mmsi] = seqs
 
-    random.shuffle(all_seqs)
-    sampled = all_seqs[:max_seqs]
+    total_seqs = sum(len(v) for v in mmsi_seqs.values())
     mmsi_info = f"{len(mmsis):,}개 MMSI" + (f" (전체 {len(mmsi_data):,}개 중)" if max_mmsi else "")
-    print(f"    → {len(sampled):,}개 ({mmsi_info}, 전체 풀: {len(all_seqs):,})")
-    return sampled
+    print(f"    → {total_seqs:,}개 시퀀스 ({mmsi_info}), max_seqs={max_seqs}")
+    return mmsi_seqs
 
 
 def build_dataset(args):
     from eval_anomaly import SCENARIO_MAKERS
 
-    # ── 정상 시퀀스: CSV 실데이터 로드 (raw) ────────────────────
+    # ── 정상 시퀀스: CSV 실데이터 로드 (MMSI 단위) ──────────────
     csv_candidates = [
         f"{DATA_DIR}/ais_preprocessed.csv",
         f"{DATA_DIR}/ais-2024-01-01_preprocessed.csv",
         f"{DATA_DIR}/ais-2025-01-25_preprocessed.csv",
         f"{DATA_DIR}/ais-2025-12-31_preprocessed.csv",
-        # 현재 디렉터리 폴백 (이전 방식 호환)
         "ais_preprocessed.csv",
         "ais-2025-01-25_preprocessed.csv",
     ]
-    raw_normal = []
+    mmsi_seqs: dict = {}
     for cand in csv_candidates:
-        raw_normal = load_normal_from_csv(
+        mmsi_seqs = load_normal_from_csv(
             cand,
             max_seqs=args.n_normal,
             max_mmsi=args.max_mmsi,
         )
-        if raw_normal:
+        if mmsi_seqs:
             break
 
-    if not raw_normal:
+    if not mmsi_seqs:
         print("  [오류] 정상 CSV 데이터를 찾을 수 없습니다. CSV 파일을 ml/data/ 폴더에 확인하세요.")
         sys.exit(1)
 
-    # ── 스케일러: 정상 데이터에서 직접 계산 후 저장 ─────────────
-    mins, maxs = compute_scaler(raw_normal)
+    # ── MMSI 단위 train/val 분리 ─────────────────────────────────
+    val_ratio  = args.val_ratio
+    all_mmsis  = list(mmsi_seqs.keys())
+    random.shuffle(all_mmsis)
+    n_val_mmsi  = max(1, int(len(all_mmsis) * val_ratio))
+    val_mmsis   = all_mmsis[:n_val_mmsi]
+    train_mmsis = all_mmsis[n_val_mmsi:]
+
+    raw_train_normal = [seq for m in train_mmsis for seq in mmsi_seqs[m]]
+    raw_val_normal   = [seq for m in val_mmsis   for seq in mmsi_seqs[m]]
+
+    # max_seqs 적용
+    random.shuffle(raw_train_normal)
+    random.shuffle(raw_val_normal)
+    n_train_cap = max(1, int(args.n_normal * (1 - val_ratio)))
+    n_val_cap   = max(1, args.n_normal - n_train_cap)
+    raw_train_normal = raw_train_normal[:n_train_cap]
+    raw_val_normal   = raw_val_normal[:n_val_cap]
+
+    print(f"  [정상 MMSI 분리] 학습 {len(train_mmsis):,}개 ({len(raw_train_normal):,}시퀀스) "
+          f"/ 검증 {len(val_mmsis):,}개 ({len(raw_val_normal):,}시퀀스)")
+
+    # ── 스케일러: 학습 정상 데이터에서만 계산 ───────────────────
+    mins, maxs = compute_scaler(raw_train_normal)
     save_scaler(mins, maxs, SCALER_SUP)
-    print(f"  [스케일러] 정상 데이터 기반으로 계산 → {SCALER_SUP}")
+    print(f"  [스케일러] 학습 정상 데이터 기반으로 계산 → {SCALER_SUP}")
 
-    normal_seqs = [scale_seq(seq, mins, maxs) for seq in raw_normal]
+    train_normal = [scale_seq(seq, mins, maxs) for seq in raw_train_normal]
+    val_normal   = [scale_seq(seq, mins, maxs) for seq in raw_val_normal]
 
-    # ── 이상 시퀀스 생성 (홀드아웃 제외, 정상 수에 비례) ─────────
+    # ── 이상 시퀀스 생성 (학습/검증 비율에 따라 분리 생성) ────────
     anom_makers = [(name, maker) for name, maker, is_anom, is_holdout
                    in SCENARIO_MAKERS if is_anom and not is_holdout]
     holdout_cnt = sum(1 for _, _, ia, ih in SCENARIO_MAKERS if ia and ih)
 
-    # --n_anom 미지정 시 정상 수 기준으로 자동 계산
     n_anom = args.n_anom if args.n_anom is not None else \
-             max(1, math.ceil(len(normal_seqs) / len(anom_makers)))
+             max(1, math.ceil(len(train_normal) / len(anom_makers)))
+    n_anom_val = max(1, math.ceil(n_anom * val_ratio / (1 - val_ratio)))
 
-    print(f"  [이상] {len(anom_makers)}개 시나리오 × {n_anom}개 = "
-          f"{len(anom_makers)*n_anom:,}개 목표  "
+    print(f"  [이상] {len(anom_makers)}개 시나리오 × 학습 {n_anom}개 / 검증 {n_anom_val}개 "
           f"(홀드아웃 {holdout_cnt}개 제외)")
-    anom_seqs = []
-    for name, maker in tqdm(anom_makers, desc="  이상 시나리오", leave=False):
-        for _ in range(n_anom):
-            try:
-                seq = maker()
-                anom_seqs.append(scale_seq(seq, mins, maxs))
-            except Exception:
-                pass
-    print(f"    → {len(anom_seqs):,}개 생성")
 
-    # ── 클래스 균형 (1:1 다운샘플) ──────────────────────────────
-    n = min(len(normal_seqs), len(anom_seqs))
-    random.shuffle(normal_seqs)
-    random.shuffle(anom_seqs)
-    normal_seqs = normal_seqs[:n]
-    anom_seqs   = anom_seqs[:n]
-    print(f"  [균형] 정상 {n:,}  이상 {n:,}  합계 {n*2:,}")
+    def _gen_anom(n_per_maker):
+        seqs = []
+        for _, maker in tqdm(anom_makers, desc="  이상 시나리오", leave=False):
+            for _ in range(n_per_maker):
+                try:
+                    seqs.append(scale_seq(maker(), mins, maxs))
+                except Exception:
+                    pass
+        return seqs
 
-    X = normal_seqs + anom_seqs
-    y = [0.0] * len(normal_seqs) + [1.0] * len(anom_seqs)
+    train_anom = _gen_anom(n_anom)
+    val_anom   = _gen_anom(n_anom_val)
+    print(f"    → 학습 {len(train_anom):,}개 / 검증 {len(val_anom):,}개 생성")
 
-    combined = list(zip(X, y))
-    random.shuffle(combined)
-    X, y = zip(*combined)
+    def _make_tensors(normal, anom):
+        n = min(len(normal), len(anom))
+        random.shuffle(normal); random.shuffle(anom)
+        normal, anom = normal[:n], anom[:n]
+        X = normal + anom
+        y = [0.0] * n + [1.0] * n
+        combined = list(zip(X, y))
+        random.shuffle(combined)
+        X, y = zip(*combined)
+        return (torch.tensor(list(X), dtype=torch.float32),
+                torch.tensor(list(y), dtype=torch.float32).unsqueeze(1))
 
-    X_t = torch.tensor(X, dtype=torch.float32)   # (N, T, F)
-    y_t = torch.tensor(y, dtype=torch.float32).unsqueeze(1)  # (N, 1)
-    return X_t, y_t
+    X_train, y_train = _make_tensors(train_normal, train_anom)
+    X_val,   y_val   = _make_tensors(val_normal,   val_anom)
+    print(f"  [균형] 학습 {len(X_train):,}  검증 {len(X_val):,}")
+    return X_train, y_train, X_val, y_val
 
 
-def make_loaders(X_t, y_t, batch_size: int, val_ratio: float):
-    dataset = TensorDataset(X_t, y_t)
-    n_val   = max(1, int(len(dataset) * val_ratio))
-    n_train = len(dataset) - n_val
-    train_ds, val_ds = random_split(
-        dataset, [n_train, n_val],
-        generator=torch.Generator().manual_seed(SEED)
-    )
+def make_loaders(X_train, y_train, X_val, y_val, batch_size: int):
+    train_ds = TensorDataset(X_train, y_train)
+    val_ds   = TensorDataset(X_val,   y_val)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False)
     return train_loader, val_loader
@@ -839,10 +860,10 @@ def main():
         device = torch.device(args.device)
     print(f"[디바이스] {device}")
 
-    # 데이터 준비 (스케일러는 CSV에서 자동 계산)
+    # 데이터 준비 (MMSI 단위 분리, 스케일러는 학습 정상 데이터 기반 계산)
     print("\n[데이터 준비]")
-    X_t, y_t = build_dataset(args)
-    train_loader, val_loader = make_loaders(X_t, y_t, args.batch, args.val_ratio)
+    X_train, y_train, X_val, y_val = build_dataset(args)
+    train_loader, val_loader = make_loaders(X_train, y_train, X_val, y_val, args.batch)
     print(f"  train: {len(train_loader.dataset):,}  val: {len(val_loader.dataset):,}")
 
     # 학습 대상 모델 목록

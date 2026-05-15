@@ -100,7 +100,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset, random_split
+from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
 # ── 공통 설정 ─────────────────────────────────────────────────────
@@ -160,7 +160,7 @@ class MinMaxScaler:
 
 
 def load_and_prepare(input_file: str, scaler_path: str = "scaler.json"):
-    """CSV 로드 → 시퀀스 생성 → 스케일러 fit → Tensor 반환"""
+    """CSV 로드 → MMSI 단위 train/val 분리 → 스케일러 fit → Tensor 반환"""
     print(f"[데이터] {input_file} 로드 중...")
     mmsi_data = defaultdict(list)
 
@@ -184,9 +184,10 @@ def load_and_prepare(input_file: str, scaler_path: str = "scaler.json"):
 
     dt_idx      = FEATURES.index("dt")
     dist_km_idx = FEATURES.index("dist_km")
-    sequences   = []
 
-    for records in mmsi_data.values():
+    # MMSI별 시퀀스 생성 (동일 MMSI 시퀀스가 train/val에 분리되지 않도록)
+    mmsi_seqs: dict = {}
+    for mmsi, records in mmsi_data.items():
         segments, current = [], [records[0]]
         for rec in records[1:]:
             if rec[dt_idx] >= SEQ_BREAK_DT:
@@ -197,38 +198,51 @@ def load_and_prepare(input_file: str, scaler_path: str = "scaler.json"):
             else:
                 current.append(rec)
         segments.append(current)
+        seqs = []
         for seg in segments:
             if len(seg) < SEQ_LEN:
                 continue
             for i in range(len(seg) - SEQ_LEN + 1):
-                sequences.append(seg[i: i + SEQ_LEN])
+                seqs.append(seg[i: i + SEQ_LEN])
+        if seqs:
+            mmsi_seqs[mmsi] = seqs
 
-    print(f"  총 시퀀스: {len(sequences):,}")
+    total_seqs = sum(len(v) for v in mmsi_seqs.values())
+    print(f"  총 시퀀스: {total_seqs:,}")
 
-    flat   = [row for seq in sequences for row in seq]
+    # MMSI 단위 train/val 분리
+    all_mmsis = list(mmsi_seqs.keys())
+    random.shuffle(all_mmsis)
+    n_val_mmsi  = max(1, int(len(all_mmsis) * VAL_RATIO))
+    val_mmsis   = all_mmsis[:n_val_mmsi]
+    train_mmsis = all_mmsis[n_val_mmsi:]
+
+    train_seqs = [seq for m in train_mmsis for seq in mmsi_seqs[m]]
+    val_seqs   = [seq for m in val_mmsis   for seq in mmsi_seqs[m]]
+    print(f"  MMSI 분리: 학습 {len(train_mmsis):,}개 ({len(train_seqs):,}시퀀스) "
+          f"/ 검증 {len(val_mmsis):,}개 ({len(val_seqs):,}시퀀스)")
+
+    # 스케일러: 학습 데이터에서만 fit (검증 데이터 분포 누수 방지)
     scaler = MinMaxScaler()
-    scaler.fit(flat)
-    scaled = [scaler.transform(seq) for seq in sequences]
+    scaler.fit([row for seq in train_seqs for row in seq])
+    train_scaled = [scaler.transform(seq) for seq in train_seqs]
+    val_scaled   = [scaler.transform(seq) for seq in val_seqs]
 
     with open(scaler_path, "w") as f:
         json.dump({"features": FEATURES, "min": scaler.min_, "max": scaler.max_}, f, indent=2)
     print(f"  스케일러 저장: {scaler_path}")
 
-    tensor = torch.tensor(scaled, dtype=torch.float32)
-    return tensor
+    train_tensor = torch.tensor(train_scaled, dtype=torch.float32)
+    val_tensor   = torch.tensor(val_scaled,   dtype=torch.float32)
+    return train_tensor, val_tensor
 
 
-def make_loaders(tensor: torch.Tensor, batch_size: int):
-    dataset = TensorDataset(tensor)
-    n_val   = max(1, int(len(dataset) * VAL_RATIO))
-    n_train = len(dataset) - n_val
-    train_ds, val_ds = random_split(
-        dataset, [n_train, n_val],
-        generator=torch.Generator().manual_seed(SEED)
-    )
+def make_loaders(train_tensor: torch.Tensor, val_tensor: torch.Tensor, batch_size: int):
+    train_ds = TensorDataset(train_tensor)
+    val_ds   = TensorDataset(val_tensor)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  drop_last=True)
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, drop_last=False)
-    print(f"  학습: {n_train:,}  검증: {n_val:,}  배치: {batch_size}")
+    print(f"  학습: {len(train_ds):,}  검증: {len(val_ds):,}  배치: {batch_size}")
     return train_loader, val_loader
 
 
@@ -1084,21 +1098,16 @@ DEFAULTS = {
 # ══════════════════════════════════════════════════════════════════
 # 메인
 # ══════════════════════════════════════════════════════════════════
-def run_model(model_name: str, tensor: torch.Tensor,
+def run_model(model_name: str, train_tensor: torch.Tensor, val_tensor: torch.Tensor,
               epochs: int, lr: float, batch_size: int,
               patience: int, device: torch.device,
-              onnx_path: str, scaler_path: str, threshold_path: str,
-              full_tensor: torch.Tensor = None):
-    # full_tensor: sklearn 모델용 (train/val 분리 전 전체 텐서)
-    if full_tensor is None:
-        full_tensor = tensor
-
+              onnx_path: str, scaler_path: str, threshold_path: str):
     print(f"\n{'='*60}")
     print(f"  모델: {model_name.upper()}")
     print(f"  epochs={epochs}  lr={lr}  batch={batch_size}  patience={patience}")
     print(f"{'='*60}")
 
-    train_loader, val_loader = make_loaders(tensor, batch_size)
+    train_loader, val_loader = make_loaders(train_tensor, val_tensor, batch_size)
 
     if model_name == "usad":
         model = USAD(SEQ_LEN, N_FEAT, latent_dim=40, hidden_dim=128).to(device)
@@ -1137,7 +1146,7 @@ def run_model(model_name: str, tensor: torch.Tensor,
 
     elif model_name in ("iforest", "ocsvm"):
         model = FlattenAE(SEQ_LEN, N_FEAT, hidden_dim=128, latent_dim=32).to(device)
-        train_sklearn_ae(model_name, model, full_tensor, train_loader, val_loader,
+        train_sklearn_ae(model_name, model, train_tensor, train_loader, val_loader,
                          device, epochs, lr, patience)
     else:
         raise ValueError(f"Unknown model: {model_name}")
@@ -1166,9 +1175,9 @@ def main():
     t0 = time.time()
     models_to_run = ["usad","tranad","conv1d","lstm","tcn","anomtrans","dcdetect","iforest","ocsvm"] if args.model == "all" else [args.model]
 
-    # 데이터는 한 번만 로드 (스케일러는 모델별로 저장)
+    # 데이터는 한 번만 로드 (MMSI 단위 분리 포함)
     first_scaler = f"scaler_{models_to_run[0]}.json"
-    tensor = load_and_prepare(args.input, scaler_path=first_scaler)
+    train_tensor, val_tensor = load_and_prepare(args.input, scaler_path=first_scaler)
 
     for name in models_to_run:
         d = DEFAULTS[name]
@@ -1186,8 +1195,8 @@ def main():
             shutil.copy(first_scaler, scaler_path)
             print(f"  스케일러 복사: {first_scaler} → {scaler_path}")
 
-        run_model(name, tensor, epochs, lr, batch_size, patience, device,
-                  onnx_path, scaler_path, threshold_path, full_tensor=tensor)
+        run_model(name, train_tensor, val_tensor, epochs, lr, batch_size, patience, device,
+                  onnx_path, scaler_path, threshold_path)
 
     print(f"\n완료! 전체 소요: {time.time() - t0:.1f}s")
     print("\n생성된 파일:")
