@@ -17,16 +17,22 @@ AIS 데이터 전처리 스크립트
   python preprocess.py jan.csv feb.csv mar.csv
 ──────────────────────────────────────────────────
 
-피처 (12개):
+피처 (15개):
     sog, cog, heading, status,
     dt, dist_km,
     cog_hdg_diff, sog_change, cog_hdg_change,
     speed_consistency,
-    lat_speed, lon_speed
+    lat_speed, lon_speed,
+    sog_z_score, cell_density_log, is_rare_cell   ← 격자 컨텍스트 (옵션)
+
+격자 컨텍스트 피처 3개는 grid_stats.json이 있을 때만 추가된다.
+파일이 없으면 12피처로만 출력 (기존 호환).
+grid_stats.json은 build_grid_stats.py로 생성한다.
 """
 
 import csv
 import glob
+import json
 import math
 import os
 import statistics
@@ -39,9 +45,11 @@ INPUT_DIR   = ""             # 폴더 지정 시 여기에 경로 입력
 INPUT_FILES = []             # 파일 명시적 목록
 
 OUTPUT_FILE = "ais_preprocessed.csv"
+GRID_STATS_FILE = "grid_stats.json"   # 없으면 12피처만 출력
 
 MIN_SEQ_LEN  = 10
 SEQ_BREAK_DT = 3600
+CELL_SIZE_DEG = 0.05   # build_grid_stats.py와 동일해야 함
 
 USE_COLS = [
     "mmsi", "base_date_time",
@@ -139,6 +147,41 @@ def iter_all_files(input_files: list, writer):
     return total
 
 
+# ── 격자 통계 로드 / lookup ──────────────────────────────────────
+def load_grid_stats(path: str) -> dict | None:
+    if not os.path.isfile(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    cs = data.get("meta", {}).get("cell_size_deg", CELL_SIZE_DEG)
+    if abs(cs - CELL_SIZE_DEG) > 1e-9:
+        print(f"  [경고] {path}의 cell_size_deg={cs}, 코드 상수={CELL_SIZE_DEG}")
+    return data
+
+
+def cell_key(lat: float, lon: float) -> str:
+    lat_idx = math.floor(lat / CELL_SIZE_DEG)
+    lon_idx = math.floor(lon / CELL_SIZE_DEG)
+    return f"{lat_idx},{lon_idx}"
+
+
+def grid_features(lat: float, lon: float, sog: float, grid_stats: dict) -> tuple:
+    """
+    (sog_z_score, cell_density_log, is_rare_cell) 반환.
+    grid_stats가 None이거나 해당 격자가 없으면 fallback 값.
+    """
+    if grid_stats is None:
+        return 0.0, 0.0, 0
+    cell = grid_stats["cells"].get(cell_key(lat, lon))
+    if cell is None:
+        return 0.0, 0.0, 1
+    mean = cell["mean_sog"]
+    std  = cell["std_sog"]
+    cnt  = cell["count"]
+    z = (sog - mean) / (std + 1e-6)
+    return round(z, 4), round(math.log(cnt + 1), 4), 0
+
+
 # ── 결측값 처리 ───────────────────────────────────────────────────
 def fill_missing(rows: list) -> list:
     defaults = {"sog": 0.0, "cog": 0.0, "heading": 511.0,
@@ -158,11 +201,24 @@ def fill_missing(rows: list) -> list:
 
 
 # ── 파생 피처 추가 ────────────────────────────────────────────────
-# 출력 피처 (12개):
+# 출력 피처 (12개 기본 + 3개 격자 옵션):
 #   dt, dist_km, cog_hdg_diff, sog_change, cog_hdg_change,
-#   speed_consistency, lat_speed, lon_speed
-def add_derived_features(rows: list) -> list:
+#   speed_consistency, lat_speed, lon_speed,
+#   sog_z_score, cell_density_log, is_rare_cell  (grid_stats 있을 때)
+def add_derived_features(rows: list, grid_stats: dict | None = None) -> list:
     for i, row in enumerate(rows):
+        # 격자 피처: 매 행마다 채움 (i==0 포함)
+        if grid_stats is not None:
+            try:
+                lat = float(row["latitude"]); lon = float(row["longitude"])
+                sog = float(row.get("sog", 0.0) or 0.0)
+                z, dens, rare = grid_features(lat, lon, sog, grid_stats)
+            except Exception:
+                z, dens, rare = 0.0, 0.0, 1
+            row["sog_z_score"]      = z
+            row["cell_density_log"] = dens
+            row["is_rare_cell"]     = rare
+
         if i == 0:
             row["dt"]                 = 0.0
             row["dist_km"]            = 0.0
@@ -278,7 +334,8 @@ def has_invalid(rows: list) -> bool:
 
 
 # ── 단일 파일 처리 (파싱→정렬→전처리→저장) ──────────────────────
-def process_file(input_path: str, output_path: str, out_cols: list) -> dict:
+def process_file(input_path: str, output_path: str, out_cols: list,
+                 grid_stats: dict | None = None) -> dict:
     """
     input_path  : 원본 CSV 1개
     output_path : 전처리 결과 저장 경로
@@ -317,7 +374,7 @@ def process_file(input_path: str, output_path: str, out_cols: list) -> dict:
         if has_invalid(rows):
             skip_log.append((mmsi, "이상값")); return 0
         rows = fill_missing(rows)
-        rows = add_derived_features(rows)
+        rows = add_derived_features(rows, grid_stats)
         if has_position_jump(rows):
             skip_log.append((mmsi, "위치 점프 감지")); return 0
         writer.writerows(rows)
@@ -368,6 +425,14 @@ def main():
     for f in input_files:
         print(f"  {f}")
 
+    grid_stats = load_grid_stats(GRID_STATS_FILE)
+    if grid_stats is not None:
+        kept = grid_stats["meta"]["total_cells_kept"]
+        print(f"[격자 통계] {GRID_STATS_FILE} 로드, 신뢰 격자 {kept:,}개 → 15피처 출력")
+    else:
+        print(f"[격자 통계] {GRID_STATS_FILE} 없음 → 12피처만 출력 "
+              f"(build_grid_stats.py 먼저 실행 권장)")
+
     out_cols = USE_COLS + [
         "dt", "dist_km",
         "cog_hdg_diff",
@@ -376,6 +441,8 @@ def main():
         "speed_consistency",
         "lat_speed", "lon_speed",
     ]
+    if grid_stats is not None:
+        out_cols += ["sog_z_score", "cell_density_log", "is_rare_cell"]
 
     part_outputs  = []   # 개별 출력 경로 목록
     all_skip_logs = []
@@ -388,7 +455,7 @@ def main():
         skip_path   = f"{stem}_skip_log.csv"
 
         print(f"\n[{stem}] 처리 중...")
-        result = process_file(fpath, out_path, out_cols)
+        result = process_file(fpath, out_path, out_cols, grid_stats)
 
         # 개별 skip 로그
         with open(skip_path, "w", newline="", encoding="utf-8") as f:
