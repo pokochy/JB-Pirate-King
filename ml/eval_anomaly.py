@@ -70,6 +70,10 @@ FEATURES = [
     "lat_speed", "lon_speed",
     "sog_z_score", "cell_density_log", "is_rare_cell",
 ]
+# 시나리오 시작 좌표 (Marine Cadastre 학습 데이터와 영역 일치)
+# Cape Hatteras 앞바다, 미국 동부 해안 AIS 트래픽 밀집 지역
+BASE_LAT = 35.5
+BASE_LON = -75.5
 SEQ_LEN        = 10
 OUTPUT_DIR     = "output"
 DATA_DIR       = "data"
@@ -228,8 +232,8 @@ def _cog_hdg_diff(cog, hdg):
 def _build_derived(step_list):
     result = []
     prev_sog, prev_chd = step_list[0]["sog"], 0.0
-    prev_lat = step_list[0].get("lat", 37.0)
-    prev_lon = step_list[0].get("lon", 126.0)
+    prev_lat = step_list[0].get("lat", BASE_LAT)
+    prev_lon = step_list[0].get("lon", BASE_LON)
     for i, s in enumerate(step_list):
         sog, cog = s["sog"], s["cog"]
         hdg    = s.get("hdg", 511)
@@ -272,7 +276,7 @@ def _build_derived(step_list):
 # ── 기존 ──────────────────────────────────────────────────────────
 def make_normal_seq():
     sog, cog = random.uniform(5,15), random.uniform(0,360)
-    lat, lon = 37., 126.
+    lat, lon = BASE_LAT, BASE_LON
     steps = []
     for _ in range(SEQ_LEN):
         dt = random.uniform(10,30); dist = sog*dt/3600*1.852
@@ -284,7 +288,7 @@ def make_normal_seq():
 
 def make_cog_hdg_mismatch_seq():
     sog, cog, mm = random.uniform(.5,20), random.uniform(0,360), random.uniform(90,180)
-    lat, lon = 37., 126.
+    lat, lon = BASE_LAT, BASE_LON
     steps = []
     for _ in range(SEQ_LEN):
         dt = random.uniform(5,60); dist = sog*dt/3600*1.852
@@ -297,7 +301,7 @@ def make_cog_hdg_mismatch_seq():
 
 def make_anchor_move_seq():
     spd, cog = random.uniform(.2,5), random.uniform(0,360)
-    lat, lon = 37., 126.
+    lat, lon = BASE_LAT, BASE_LON
     steps = []
     for _ in range(SEQ_LEN):
         dt = random.uniform(5,60); dist = spd*dt/3600*1.852
@@ -312,7 +316,7 @@ def make_speed_spike_seq():
     base, spike = random.uniform(2,15), random.uniform(20,50)
     ss, sl = random.randint(0,SEQ_LEN-3), random.randint(1,3)
     cog = random.uniform(0,360)
-    lat, lon = 37., 126.
+    lat, lon = BASE_LAT, BASE_LON
     steps = []
     for i in range(SEQ_LEN):
         sog = spike if ss<=i<ss+sl else base
@@ -327,7 +331,7 @@ def make_speed_spike_seq():
 def make_position_jump_seq():
     spd, jd = random.uniform(2,10), random.uniform(5,50)
     ji, cog = random.randint(1,SEQ_LEN-2), random.uniform(0,360)
-    lat, lon = 37., 126.
+    lat, lon = BASE_LAT, BASE_LON
     steps = []
     for i in range(SEQ_LEN):
         dt = random.uniform(5,60)
@@ -340,7 +344,7 @@ def make_position_jump_seq():
     return _build_derived(steps)
 
 def make_fn_dt_jump_seq():
-    lat, lon = 37., 126.
+    lat, lon = BASE_LAT, BASE_LON
     steps = []
     for _ in range(SEQ_LEN):
         dt = random.uniform(61,299); sog = random.choice([2.,18.,3.,20.])
@@ -353,7 +357,7 @@ def make_fn_dt_jump_seq():
 
 def make_fn_speed_ramp_seq():
     sog, cog = 2., random.uniform(0,360)
-    lat, lon = 37., 126.
+    lat, lon = BASE_LAT, BASE_LON
     steps = []
     for _ in range(SEQ_LEN):
         dt = random.uniform(30,55); dist = sog*dt/3600*1.852
@@ -366,7 +370,7 @@ def make_fn_speed_ramp_seq():
 
 def make_fn_cog_border_seq():
     sog, cog, mm = random.uniform(3,10), random.uniform(0,360), random.uniform(91,99)
-    lat, lon = 37., 126.
+    lat, lon = BASE_LAT, BASE_LON
     steps = []
     for _ in range(SEQ_LEN):
         dt = random.uniform(10,30); dist = sog*dt/3600*1.852
@@ -380,7 +384,7 @@ def make_fn_cog_border_seq():
 def make_fn_nav_status_seq():
     status = random.choice([2,3,7,8,11,12])
     sog, cog = random.uniform(.5,5), random.uniform(0,360)
-    lat, lon = 37., 126.
+    lat, lon = BASE_LAT, BASE_LON
     steps = []
     for _ in range(SEQ_LEN):
         dt = random.uniform(10,30); dist = sog*dt/3600*1.852
@@ -398,7 +402,7 @@ def make_ml_low_slow_seq():
     sog = random.uniform(0.3, 2.0)
     cog = random.uniform(0, 360)
     hdg_offset = random.uniform(50, 95)
-    lat, lon = 37., 126.
+    lat, lon = BASE_LAT, BASE_LON
     steps = []
     for _ in range(SEQ_LEN):
         dt = random.uniform(10, 30)
@@ -419,7 +423,7 @@ def make_ml_temporal_seq():
     anom_sog = random.uniform(35, 45)
     base_sog = random.uniform(5, 12)
     cog = random.uniform(0, 360)
-    lat, lon = 37., 126.
+    lat, lon = BASE_LAT, BASE_LON
     steps = []
     for i in range(SEQ_LEN):
         is_anom = (i % (norm_n + 1) == 0)
@@ -438,8 +442,8 @@ def make_ml_gradual_drift_seq():
     """D3 Gradual Drift: GPS 노이즈 수준 이동 누적"""
     step_deg = random.uniform(0.0003, 0.0006)
     drift_dir = random.uniform(0, 360)
-    lat = 37. + random.uniform(-0.1, 0.1)
-    lon = 126. + random.uniform(-0.1, 0.1)
+    lat = BASE_LAT + random.uniform(-0.1, 0.1)
+    lon = BASE_LON + random.uniform(-0.1, 0.1)
     steps = []
     for _ in range(SEQ_LEN):
         dt = random.uniform(10, 30)
@@ -459,7 +463,7 @@ def make_ml_mimicry_seq():
     hidden_sog = random.uniform(10, 20)
     hidden_dir = random.uniform(0, 360)
     cog = random.uniform(0, 360)
-    lat, lon = 37., 126.
+    lat, lon = BASE_LAT, BASE_LON
     steps = []
     for i in range(SEQ_LEN):
         report_sog = profile[i % len(profile)]
@@ -479,7 +483,7 @@ def make_adv_smooth_seq():
     sog = random.uniform(10, 20)
     cog = random.uniform(0, 360)
     omega = random.uniform(1, 3) * random.choice([-1, 1])
-    lat, lon = 37., 126.
+    lat, lon = BASE_LAT, BASE_LON
     steps = []
     for _ in range(SEQ_LEN):
         dt = random.uniform(5, 20)
@@ -498,7 +502,7 @@ def make_adv_desync_seq():
     spike_offset = random.uniform(0, 40)
     spike_interval = random.uniform(30, 70)
     cog = random.uniform(0, 360)
-    lat, lon = 37., 126.
+    lat, lon = BASE_LAT, BASE_LON
     steps = []
     for i in range(SEQ_LEN):
         t_elapsed = i * 15 + spike_offset
@@ -521,7 +525,7 @@ def make_adv_window_edge_seq():
     norm_sog = random.uniform(8, 14)
     anom_sog = random.uniform(38, 46)
     cog = random.uniform(0, 360)
-    lat, lon = 37., 126.
+    lat, lon = BASE_LAT, BASE_LON
     steps = []
     for i in range(SEQ_LEN):
         is_edge = (i % wsize == wsize - 1)
@@ -549,7 +553,7 @@ def make_adv_contextual_seq():
     phase_elapsed = 0.0
     hidden_sog = random.uniform(2, 4)
     hidden_dir = random.uniform(0, 360)
-    lat, lon = 37., 126.
+    lat, lon = BASE_LAT, BASE_LON
     cog = random.uniform(0, 360)
     steps = []
     for _ in range(SEQ_LEN):
@@ -576,8 +580,8 @@ def make_adv_shadow_seq():
     _COASTAL_HDGS = [45, 90, 135, 225, 270, 315]
     sog = random.uniform(10, 14)
     base_cog = random.choice(_COASTAL_HDGS) + random.uniform(-10, 10)
-    lat = 37. + random.uniform(-0.3, 0.3)
-    lon = 126. + random.uniform(-0.3, 0.3)
+    lat = BASE_LAT + random.uniform(-0.3, 0.3)
+    lon = BASE_LON + random.uniform(-0.3, 0.3)
     target_lat = lat + random.uniform(0.05, 0.15)
     target_lon = lon + random.uniform(0.05, 0.15)
     cog = base_cog
@@ -604,8 +608,8 @@ def make_feat_smoothing_seq():
     dpos_max = 0.01
     sog = random.uniform(5, 12)
     cog = random.uniform(0, 360)
-    lat = 37. + random.uniform(-0.05, 0.05)
-    lon = 126. + random.uniform(-0.05, 0.05)
+    lat = BASE_LAT + random.uniform(-0.05, 0.05)
+    lon = BASE_LON + random.uniform(-0.05, 0.05)
     target_lat = lat + random.uniform(0.1, 0.25)
     target_lon = lon + random.uniform(0.1, 0.25)
     steps = []
@@ -639,7 +643,7 @@ def make_intermittent_spoof_seq():
     base_sog = random.uniform(5, 12)
     cog = random.uniform(0, 360)
     elapsed = random.uniform(0, tn)
-    lat, lon = 37., 126.
+    lat, lon = BASE_LAT, BASE_LON
     steps = []
     for _ in range(SEQ_LEN):
         dt = random.uniform(5, 20)
@@ -662,8 +666,8 @@ def make_traj_stitch_seq():
     hdg_b = (hdg_a + random.uniform(120, 240)) % 360
     sog = random.uniform(8, 15)
     stitch_steps = random.randint(3, 5)
-    lat = 37. + random.uniform(-0.05, 0.05)
-    lon = 126. + random.uniform(-0.05, 0.05)
+    lat = BASE_LAT + random.uniform(-0.05, 0.05)
+    lon = BASE_LON + random.uniform(-0.05, 0.05)
     cog = hdg_a
     switch_at = random.randint(2, SEQ_LEN - stitch_steps - 1)
     steps = []
@@ -692,7 +696,7 @@ def make_time_skew_seq():
     burst_n = random.randint(3, 5)
     burst_dist_per_step = random.uniform(0.015, 0.025)
     cog = random.uniform(0, 360)
-    lat, lon = 37., 126.
+    lat, lon = BASE_LAT, BASE_LON
     steps = []
     for i in range(SEQ_LEN):
         dt = random.uniform(5, 20)
@@ -716,8 +720,8 @@ def make_multi_coord_seq():
     base_cog = random.choice(_COASTAL_HDGS) + random.uniform(-10, 10)
     bias = random.uniform(0.2, 0.4)
     sog = random.uniform(8, 13)
-    lat = 37. + random.uniform(-0.1, 0.1)
-    lon = 126. + random.uniform(-0.1, 0.1)
+    lat = BASE_LAT + random.uniform(-0.1, 0.1)
+    lon = BASE_LON + random.uniform(-0.1, 0.1)
     target_lat = lat + random.uniform(0.1, 0.2)
     target_lon = lon + random.uniform(0.1, 0.2)
     cog = base_cog
@@ -742,7 +746,7 @@ def make_ais_gap_seq():
     gap_at = random.randint(2, SEQ_LEN - 3)
     gap_dt = random.uniform(300, 600)
     jump_dist = random.uniform(0.15, 0.4)
-    lat, lon = 37., 126.
+    lat, lon = BASE_LAT, BASE_LON
     steps = []
     for i in range(SEQ_LEN):
         if i == gap_at:
@@ -770,8 +774,8 @@ def make_lstm_beat_seq():
     sigma_cog = random.uniform(2.0, 4.0)
     sog = random.uniform(6, 12)
     cog = random.uniform(0, 360)
-    lat = 37. + random.uniform(-0.05, 0.05)
-    lon = 126. + random.uniform(-0.05, 0.05)
+    lat = BASE_LAT + random.uniform(-0.05, 0.05)
+    lon = BASE_LON + random.uniform(-0.05, 0.05)
     target_lat = lat + random.uniform(0.2, 0.35)
     target_lon = lon + random.uniform(0.2, 0.35)
     steps = []
