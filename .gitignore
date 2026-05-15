@@ -13,6 +13,10 @@ ml/*.onnx
 ml/threshold*.txt
 ml/scaler*.json
 ml/eval_result_*.txt
+ml/grid_stats.json
+ml/*_skip_log.csv
+ml/*.png
+ml/*.log
 
 aivdm_gen/*.csv
 

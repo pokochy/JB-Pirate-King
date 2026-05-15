@@ -72,8 +72,8 @@ FEATURES = [
 ]
 # 시나리오 시작 좌표 (Marine Cadastre 학습 데이터와 영역 일치)
 # Cape Hatteras 앞바다, 미국 동부 해안 AIS 트래픽 밀집 지역
-BASE_LAT = 35.5
-BASE_LON = -75.5
+BASE_LAT = 35.225
+BASE_LON = -75.775
 SEQ_LEN        = 10
 OUTPUT_DIR     = "output"
 DATA_DIR       = "data"
@@ -120,7 +120,11 @@ def load_scaler(path):
 
 def scale_val(val, mn, mx):
     d = mx - mn
-    return (val - mn) / d if d != 0 else 0.0
+    if d == 0:
+        return 0.0
+    s = (val - mn) / d
+    # 학습 시 MinMaxScaler가 [0,1]로 클램프하므로 eval도 동일하게 처리
+    return max(0.0, min(1.0, s))
 
 def scale_seq(seq, mins, maxs):
     return [[scale_val(v, mins[i], maxs[i]) for i, v in enumerate(row)]
