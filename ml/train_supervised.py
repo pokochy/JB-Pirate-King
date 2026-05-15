@@ -78,9 +78,10 @@ FEATURES = [
     "cog_hdg_change",
     "speed_consistency",
     "lat_speed", "lon_speed",
+    "sog_z_score", "cell_density_log", "is_rare_cell",
 ]
 SEQ_LEN        = 10
-N_FEAT         = len(FEATURES)   # 12
+N_FEAT         = len(FEATURES)   # 15
 SEED           = 42
 SEQ_BREAK_DT   = 600
 SCALER_SUP     = "output/scaler_sup.json"   # 지도 학습 전용 스케일러

@@ -68,6 +68,7 @@ FEATURES = [
     "cog_hdg_change",
     "speed_consistency",
     "lat_speed", "lon_speed",
+    "sog_z_score", "cell_density_log", "is_rare_cell",
 ]
 SEQ_LEN        = 10
 OUTPUT_DIR     = "output"
@@ -192,6 +193,32 @@ def load_real_normal_seqs(mins, maxs, n_seqs=3000, max_rows=300000) -> list:
 
 
 
+# ── 격자 통계 로드 (preprocess.py와 동일 키 체계) ────────────────
+import json as _json
+_GRID_STATS_FILE = "grid_stats.json"
+_CELL_SIZE_DEG   = 0.05
+
+def _load_grid_stats(path: str):
+    if not os.path.isfile(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return _json.load(f)
+
+_GRID_STATS = _load_grid_stats(_GRID_STATS_FILE)
+
+def _grid_feats(lat: float, lon: float, sog: float) -> tuple:
+    """(sog_z_score, cell_density_log, is_rare_cell)"""
+    if _GRID_STATS is None:
+        return 0.0, 0.0, 0
+    lat_idx = math.floor(lat / _CELL_SIZE_DEG)
+    lon_idx = math.floor(lon / _CELL_SIZE_DEG)
+    cell = _GRID_STATS["cells"].get(f"{lat_idx},{lon_idx}")
+    if cell is None:
+        return 0.0, 0.0, 1
+    z = (sog - cell["mean_sog"]) / (cell["std_sog"] + 1e-6)
+    return round(z, 4), round(math.log(cell["count"] + 1), 4), 0
+
+
 # ── 시퀀스 생성 헬퍼 ──────────────────────────────────────────────
 def _cog_hdg_diff(cog, hdg):
     if hdg >= 511: return -1.0
@@ -226,9 +253,12 @@ def _build_derived(step_list):
             lat_spd = round((lat - prev_lat) / dt, 6)
             lon_spd = round((lon - prev_lon) / dt, 6)
 
+        z, dens, rare = _grid_feats(lat, lon, sog)
+
         result.append([sog, cog, hdg if hdg < 511 else 0., status,
                         dt, dist, chd, sog_ch, chd_change,
-                        speed_cons, lat_spd, lon_spd])
+                        speed_cons, lat_spd, lon_spd,
+                        z, dens, rare])
         prev_sog = sog
         prev_chd = chd if chd >= 0 else prev_chd
         prev_lat, prev_lon = lat, lon
