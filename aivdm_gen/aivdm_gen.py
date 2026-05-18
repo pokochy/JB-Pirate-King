@@ -1129,6 +1129,206 @@ class AISGap(AttackPlugin):
 #       목표 위치 방향으로 아주 천천히 이동 (Gradual Drift의 고급버전)
 
 
+# ═══════════════════════════════════════════════════
+#  G  복합 믹스 공격 (Multi-Vector Mixed Attacks)
+#  두 개 이상의 공격 벡터를 동시에 조합하여 IDS/ML 탐지 난이도 극대화
+# ═══════════════════════════════════════════════════
+
+# ─── G1  Ghost Convoy (AIS Gap + Shadow Vessel 믹스) ──────────
+# 동작: 선박군이 일정 시간 정상 항해(E5 Shadow Vessel 패턴)를 하다가
+#       갑자기 침묵(F6 AIS Gap)한 뒤, 목표 방향으로 재등장.
+#       재등장 후에도 정상 화물선 프로파일 유지.
+# 회피: 침묵 전 구간: MMSI/SOG/navStatus 전 정상 (E5)
+#       재등장 후: 이력 초기화 + 새 정상 항해 (F6)
+@_reg
+class GhostConvoy(AttackPlugin):
+    meta = AttackMeta(
+        key="ghost_convoy", label="G1  [MIX] Ghost Convoy",
+        category="G",
+        purpose="AIS Gap + Shadow Vessel 복합 — 침묵 후 재등장 이력 리셋",
+        evasion="침묵 전: 정상 화물선 프로파일. 재등장 후: 신규 MMSI처럼 이력 없음",
+        expected_fn="규칙 IDS: Gap 경보 1회. ML: 재등장 후 정상 클러스터로 복귀")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",1,30,8),
+                _pi("정상 항해 시간 (초)","active",10,120,40,5),
+                _pi("침묵 시간 (초)","silence",31,600,150,10),
+                _pi("재등장 오프셋 (도)","jump",0.05,0.5,0.18,0.05),
+                _pi("항해 속도 (kn)","sog",5,20,11,0.5),
+                _pi("목표 위도 오프셋","tlat_off",-0.5,0.5,0.0,0.05),
+                _pi("목표 경도 오프셋","tlon_off",-0.5,0.5,0.0,0.05)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",8)); cl=cfg["clat"]; cn=cfg["clon"]
+        tl=cl+float(cfg.get("tlat_off",0)); tn=cn+float(cfg.get("tlon_off",0))
+        fleet=[]
+        for i in range(n):
+            ang=2*math.pi*i/n; sd=0.30
+            mmsi=random.choice([440,441])*1000000+random.randint(100000,999999)
+            v=Vessel(mmsi,f"GHC{mmsi%100000:05d}")
+            v.lat=tl+math.cos(ang)*sd; v.lon=tn+math.sin(ang)*sd*1.2
+            spd=float(cfg.get("sog",11))+random.uniform(-1,1)
+            to_t=math.degrees(math.atan2(tn-v.lon,tl-v.lat)+1e-9)%360
+            v.sog=spd; v.cog=to_t+random.uniform(-8,8); v.hdg=int(v.cog); v.nav=0
+            v.sx("tl",tl); v.sx("tn",tn); v.sx("bs",spd)
+            v.sx("phase","active"); v.sx("pt",random.uniform(0,float(cfg.get("active",40))))
+            v.sx("silence",float(cfg.get("silence",150)))
+            v.sx("active",float(cfg.get("active",40)))
+            v.sx("jump",float(cfg.get("jump",0.18)))
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            v.sx("pt",v.x("pt")+dt)
+            ph=v.x("phase")
+            if ph=="active":
+                dl=v.x("tl")-v.lat; dn=v.x("tn")-v.lon
+                dist=math.sqrt(dl**2+dn**2)+1e-9
+                tc=math.degrees(math.atan2(dn,dl)+1e-9)%360
+                v.cog=(0.9*v.cog+0.1*tc)%360
+                v.hdg=int(v.cog+random.uniform(-3,3))%360
+                v.sog=v.x("bs")+random.uniform(-0.5,0.5); v.nav=0
+                _step(v,dt)
+                if v.x("pt")>=v.x("active"):
+                    ang=random.uniform(0,360); jd=v.x("jump")
+                    v.sx("next_lat",v.lat+math.cos(math.radians(ang))*jd)
+                    v.sx("next_lon",v.lon+math.sin(math.radians(ang))*jd*1.2)
+                    v.lat=0; v.lon=0; v.sog=0
+                    v.sx("phase","silent"); v.sx("pt",0)
+            else:  # silent
+                if v.x("pt")>=v.x("silence"):
+                    v.lat=v.x("next_lat"); v.lon=v.x("next_lon")
+                    v.sog=v.x("bs"); v.cog=random.uniform(0,360); v.hdg=int(v.cog); v.nav=0
+                    v.sx("phase","active"); v.sx("pt",0)
+
+
+# ─── G2  Stealth Creep (Gradual Drift + Temporal Camouflage 믹스) ──
+# 동작: 정상 N개 메시지 사이에 이상 1개를 숨기되(D2),
+#       각 틱에서 GPS 오차 수준의 극소량 이동도 누적(D3).
+#       두 회피 기법이 상호 보완: Temporal은 burst 이상을 희석,
+#       Gradual은 위치 축적 이동을 정상 노이즈로 위장.
+# 회피: 단기 window에서 모든 피처 정상 범위. 장기 누적만 이상.
+@_reg
+class StealthCreep(AttackPlugin):
+    meta = AttackMeta(
+        key="stealth_creep", label="G2  [MIX] Stealth Creep",
+        category="G",
+        purpose="Temporal Camouflage + Gradual Drift 복합 — 장기 누적 탐지 극히 어려움",
+        evasion="burst 이상은 N개 정상에 희석, 미세 이동은 GPS 노이즈로 위장",
+        expected_fn="단기 탐지기: 완전 통과. 장기 궤적 분석만 이동 누적 검출 가능")
+
+    def param_defs(self):
+        return [_pi("선박 수","count",1,50,10),
+                _pi("정상 메시지 수 N","norm_n",2,20,9,1),
+                _pi("이상 SOG (kn)","anom_sog",10,60,38,1),
+                _pi("드리프트 스텝 (도/틱)","drift_step",0.0001,0.001,0.0003,0.0001),
+                _pi("침투 방향 (도)","ddir",0,359,135,5)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",10)); cl=cfg["clat"]; cn=cfg["clon"]
+        fleet=[]
+        for i in range(n):
+            v=Vessel(994100000+i,f"SC-{i+1:03d}",nav=1)
+            _place(v,cl,cn,0.06); v.sog=random.uniform(0.1,0.4)
+            v.cog=random.uniform(0,360); v.hdg=int(v.cog)
+            v.sx("cnt",0); v.sx("nn",int(cfg.get("norm_n",9)))
+            v.sx("as",float(cfg.get("anom_sog",38)))
+            v.sx("bs",v.sog); v.sx("bc",v.cog)
+            v.sx("step",float(cfg.get("drift_step",0.0003)))
+            v.sx("ddir",float(cfg.get("ddir",135))+random.uniform(-15,15))
+            fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        for v in fleet:
+            v.sx("cnt",v.x("cnt")+1)
+            # Temporal Camouflage: N번에 1번 이상 삽입
+            if v.x("cnt")%(v.x("nn")+1)==0:
+                v.sog=v.x("as")
+                v.cog=(v.x("bc")+175)%360; v.hdg=int((v.cog+160)%360)
+            else:
+                v.sog=max(0.05,v.x("bs")+random.uniform(-0.1,0.1))
+                v.cog=(v.x("bc")+random.uniform(-2,2))%360; v.hdg=int(v.cog)
+            # Gradual Drift: 매 틱 GPS 오차 수준 미세 이동 누적
+            r=math.radians(v.x("ddir")); st=v.x("step")
+            v.lat+=math.cos(r)*st+random.uniform(-st*0.25,st*0.25)
+            v.lon+=math.sin(r)*st*1.2+random.uniform(-st*0.25,st*0.25)
+
+
+# ─── G3  Predator Swarm (Pincer + Low&Slow + Contextual Blend 믹스) ─
+# 동작: 어선으로 위장한 선박군(E4)이 집게 대형(B6)으로 목표에 수렴하되
+#       각 선박의 개별 속도·COG 변화는 Low&Slow(D1) 임계값 이내로 유지.
+#       3개 회피 기법을 동시 적용: 선종 위장 + 집게 수렴 + ML 피처 클램핑.
+# 회피: 선종/navStatus: 어선 클러스터 내 정상 (E4)
+#       개별 거동: Δsog<9.9, dist<5km/min (D1)
+#       fleet-level: 수렴 패턴이 존재하나 어선 조업 특성으로 해석 가능
+@_reg
+class PredatorSwarm(AttackPlugin):
+    meta = AttackMeta(
+        key="predator_swarm", label="G3  [MIX] Predator Swarm",
+        category="G",
+        purpose="Pincer + Low&Slow + Contextual Blend 3중 복합 — 어선 위장 집게 수렴",
+        evasion="어선 프로파일(shipType=30+nav=7) + 저속 임계 이하 + fleet 수렴",
+        expected_fn="규칙 IDS: 전 통과. ML: 어선 클러스터 내 수렴 이상 고난이도 탐지")
+
+    def param_defs(self):
+        return [_pi("선박 수 (양날 합)","count",4,60,16,2),
+                _pi("날개 폭 (도)","width",0.05,1.5,0.4,0.05),
+                _pi("종심 (도)","depth",0.05,1.0,0.25,0.05),
+                _pi("수렴 속도 (kn)","speed",0.5,4.5,2.5,0.1),
+                _pi("COG 노이즈 (도)","cog_noise",0,30,12,1),
+                _pi("조업 위상 분산 (초)","phase_spread",10,120,40,5)]
+
+    def make(self,cfg):
+        n=int(cfg.get("count",16)); cl=cfg["clat"]; cn=cfg["clon"]
+        w=float(cfg.get("width",0.4)); dep=float(cfg.get("depth",0.25))
+        half=n//2; fleet=[]
+        for i in range(half):
+            t=i/max(half-1,1)
+            for side,sign in [("L",-1),("R",1)]:
+                mmsi=random.choice([440,441])*1000000+random.randint(100000,999999)
+                v=Vessel(mmsi,f"KFP{mmsi%10000:04d}")
+                v.lat=cl+dep*(1-t); v.lon=cn+sign*w*t
+                spd=float(cfg.get("speed",2.5))+random.uniform(-0.3,0.3)
+                v.sog=spd; v.nav=7
+                v.cog=math.degrees(math.atan2(cn-v.lon,cl-v.lat)+1e-9)%360
+                v.hdg=int(v.cog)
+                v.sx("tl",cl); v.sx("tn",cn); v.sx("bs",spd)
+                # 어선 조업 위상: 선박마다 다른 위상에서 시작
+                ps=float(cfg.get("phase_spread",40))
+                v.sx("fish_t",random.uniform(0,ps))
+                v.sx("fish_period",random.uniform(60,180))
+                v.sx("cog_base",v.cog)
+                fleet.append(v)
+        return fleet
+
+    def update(self,fleet,elapsed,dt,cfg):
+        spd=float(cfg.get("speed",2.5))
+        cn_noise=float(cfg.get("cog_noise",12))
+        for v in fleet:
+            v.sx("fish_t",v.x("fish_t")+dt)
+            # 어선 조업 주기에 따라 navStatus 변환
+            phase=(v.x("fish_t")%v.x("fish_period"))/v.x("fish_period")
+            if phase<0.3:
+                v.nav=7; v.sog=min(3.5,v.x("bs")+random.uniform(-0.2,0.2))
+            elif phase<0.6:
+                v.nav=7; v.sog=max(0.5,v.x("bs")*0.4+random.uniform(-0.1,0.1))
+            else:
+                v.nav=0; v.sog=v.x("bs")+random.uniform(-0.3,0.3)
+            # 집게 수렴: 목표 방향으로 저속 접근
+            dl=v.x("tl")-v.lat; dn=v.x("tn")-v.lon
+            dist=math.sqrt(dl**2+dn**2)+1e-9
+            if dist>0.005:
+                tc=math.degrees(math.atan2(dn,dl)+1e-9)%360
+                # Low&Slow: COG 변화를 부드럽게 (임계 이하)
+                v.cog=(0.92*v.cog+0.08*tc+random.uniform(-cn_noise*0.3,cn_noise*0.3))%360
+                v.hdg=int((v.cog+random.uniform(-cn_noise*0.5,cn_noise*0.5))%360)
+                step=v.sog*_KN_TO_DPS*dt
+                v.lat+=dl/dist*step; v.lon+=dn/dist*step
+            else:
+                v.lat+=random.uniform(-0.001,0.001); v.lon+=random.uniform(-0.001,0.001)
+
 
 # ═══════════════════════════════════════════════════
 #  §6  SimEngine
@@ -1349,6 +1549,7 @@ class App(tk.Tk):
         s.configure("A.TLabel", background=bg,foreground="#ffcc44",font=("Consolas",10,"bold"))
         s.configure("ML.TLabel",background=bg,foreground="#ff9f44",font=("Consolas",10,"bold"))
         s.configure("ADV.TLabel",background=bg,foreground="#ff4488",font=("Consolas",10,"bold"))
+        s.configure("MIX.TLabel",background=bg,foreground="#c944ff",font=("Consolas",10,"bold"))
         s.configure("Sub.TLabel",background=bg,foreground=sb,font=("Consolas",9))
         s.configure("TEntry",fieldbackground=eb,foreground="#ffffff",insertcolor=ac,borderwidth=0)
         s.configure("TSpinbox",fieldbackground=eb,foreground="#ffffff",
@@ -1471,7 +1672,8 @@ class App(tk.Tk):
             frame=ttk.Frame(p); frame.pack(fill="x")
             self._param_widgets[key]={}
             cat_style={"A":"H.TLabel","B":"H.TLabel","C":"A.TLabel",
-                       "D":"ML.TLabel","E":"ADV.TLabel","F":"ADV.TLabel"
+                       "D":"ML.TLabel","E":"ADV.TLabel","F":"ADV.TLabel",
+                       "G":"MIX.TLabel"
                        }.get(plugin.meta.category,"H.TLabel")
             self._section(frame,f"{plugin.meta.label}  파라미터",style=cat_style)
             for pd in plugin.param_defs():
